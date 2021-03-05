@@ -1,0 +1,784 @@
+	DSK CANYON
+	
+
+**************************************************
+* To Do: 
+*	adjust perspective to lean forward/back
+*	turning/sliding left/right
+*	additional example with light/shadow?
+*	Mode switch for demo purposes.
+**************************************************
+* Variables
+**************************************************
+TMP				EQU		$06			; scratch
+LOBYTE			EQU		$00
+HIBYTE			EQU		$01
+
+CHAR			EQU		$FC			; char/pixel to plot
+
+BASELINE		EQU		$FB			; current plotrow to return to
+PLOTROW			EQU		$FE			; 0-47 (#00-#30)
+PLOTCOLUMN		EQU		$FF			; 0-39 (#00-#28)
+
+ROLBYTE			EQU		$FA			; byte for perspective
+PROGRESS 		EQU		$FD			; byte counter
+
+CANYONDATALO	EQU		$02			; pixel data starts
+CANYONDATAHI	EQU		$03			; memory page
+
+PERSPECTIVELO	EQU		$04			; processing data starts
+PERSPECTIVEHI	EQU		$05			; 
+
+SCREENDATALO	EQU		$07			; displayed data starts
+SCREENDATAHI	EQU		$08			; memory page
+
+HEIGHTBYTE		EQU		$09			; how tall to draw
+CDEND			EQU		$0A			; hi byte of data end
+
+HORIZON			EQU		$0B			; for Demo
+
+**************************************************
+* Apple Standard Memory Locations
+**************************************************
+CLRLORES  	EQU	$F832
+LORES     	EQU	$C050
+TXTSET    	EQU	$C051
+MIXCLR    	EQU	$C052
+MIXSET    	EQU	$C053
+TXTPAGE1  	EQU	$C054
+TXTPAGE2  	EQU	$C055
+KEY       	EQU	$C000
+C80STOREOF	EQU	$C000
+C80STOREON	EQU	$C001
+STROBE    	EQU	$C010
+SPEAKER   	EQU	$C030
+VBL       	EQU	$C02E
+RDVBLBAR  	EQU	$C019       ;not VBL (VBL signal low
+WAIT		EQU	$FCA8 
+RAMWRTAUX 	EQU	$C005
+RAMWRTMAIN	EQU	$C004
+SETAN3    	EQU	$C05E       ;Set annunciator-3 output to 0
+SET80VID  	EQU	$C00D       ;enable 80-column display mode (WR-only)
+CLR80VID	EQU	$C00C
+HOME 		EQU	$FC58		; clear the text screen
+CH        	EQU	$24			; cursor Horiz
+CV        	EQU	$25			; cursor Vert
+VTAB      	EQU	$FC22       ; Sets the cursor vertical position (from CV)
+COUT      	EQU	$FDED       ; Calls the output routine whose address is stored in CSW,
+          	   	            ;  normally COUTI
+STROUT		EQU	$DB3A 		;Y=String ptr high, A=String ptr low
+		
+ALTTEXT		EQU	$C055
+ALTTEXTOFF	EQU	$C054
+RDPAGE2		EQU	$C01C		; high bit set if on page2
+ROMINIT   	EQU $FB2F
+ROMSETKBD 	EQU $FE89
+ROMSETVID 	EQU $FE93
+	
+ALTCHAR		EQU	$C00F		; enables alternative character set - mousetext
+	
+BLINK		EQU	$F3
+SPEED		EQU	$F1
+
+BELL   		EQU	$FF3A     				; Monitor BELL routine
+CROUT  		EQU	$FD8E     				; Monitor CROUT routine
+PRBYTE 		EQU	$FDDA     				; Monitor PRBYTE routine
+MLI    		EQU	$BF00     				; ProDOS system call
+OPENCMD		EQU	$C8						; OPEN command index
+READCMD		EQU	$CA						; READ command index
+CLOSECMD	EQU	$CC						; CLOSE command index
+
+OPENAPPLE	EQU	$C061					; shift down = bit 7
+
+
+**************************************************
+* START - sets up various fiddly zero page bits
+**************************************************
+
+				ORG $2000						; PROGRAM DATA STARTS AT $2000
+
+				JSR ROMSETVID           	 	; Init char output hook at $36/$37
+				JSR ROMSETKBD           	 	; Init key input hook at $38/$39
+				JSR ROMINIT               	 	; GR/HGR off, Text page 1
+				
+				LDA #$00
+				STA BLINK						; blinking text? no thanks.
+				STA LORES						; low res graphics mode
+				STA MIXCLR
+
+				BIT TXTPAGE1
+				JSR CLEARSKY					; clear screen		
+				BIT TXTPAGE2
+				JSR CLEARSKY					; clear screen		
+
+								
+
+
+* data size		7800
+* data starts 	2500
+* data ends 	9d00 (2500 + 7800)
+
+* screen size	12c0
+
+; pixels in memory start at end of program code
+; 120px per line = #$78
+
+* LOAD TERRAIN DATA FROM DISK
+				JSR BLOAD
+
+				LDA CDHI						; start of CANYONDATA
+				STA CANYONDATAHI
+				STA SCREENDATAHI
+				
+				CLC
+				ADC #$78						; data is $7800 long
+				STA CDEND
+
+				LDA CDLO						; should be #$00
+				STA CANYONDATALO
+				STA SCREENDATALO
+				
+				DEC PDLO
+				
+				LDA #$0A
+				STA HORIZON
+
+* APPEND FIRST SCREEN TO END OF TERRAIN DATA FOR SMOOTH LOOP
+				JSR LOOPTERRAIN					; appends $11D0 (38 lines of 120 bytes)
+				
+				
+
+**************************************************
+*	MAIN LOOP
+**************************************************
+												; 1 - 965,487 cycles
+												; 2 - 822,028 			CHECKROW		BCC NEXTPIXEL
+												; 3 - 813,377			ADDCHARTOPIXEL
+												; 4 - 765,409			LSR clears high bits.
+												; 5 - 773,160			GRRR.
+												; 6 - reversing render
+												; 7 - 795,705		
+												; 8 - 740,233			render only on black
+												; 9 - 801,500			double buffer
+												; 10 - 674,168			added shortcuts
+												; 11 - 630,679			optimized loops for frame,row,column
+												; skip ahead 8 terrain bytes on 00 perspective byte
+												; 12 - 618,134
+												; skip ahead (progress) bytes any time rolbyte = 00.
+												; 13 - 660,294 - MEH.
+												; 14 - 645,099 - checking cycle count for first full screen.
+												; skip ahead if end of row reached before checking perspective 00s
+												; 15 - 573,699			started making macros and ]loops
+												; 572,142
+												; 16 - 568,259 reverse perspective bytes to INC instead of SBC
+												; 17 - 536,209 TAX instead of LDA STA in DRAWPIXEL
+												; 18 - start at top of heightpixel, go down until bg is not X0, skip the rest
+												; 531,472	combine two runs of plotpixel if target == 00.
+												; 19 - 392,381 "shortcutZ"
+												; 20 - 419,717 added page flipping. Maybe do one test and branch?
+												; 21 - 396,788
+
+
+
+* EACH FRAME													
+NEXTFRAME		BIT RDPAGE2						; hi bit on = on page 2. Set to page 1
+				BPL SETPAGE2					; hi bit off, set to page 2
+
+SETPAGE1		BIT TXTPAGE1					; set to page 1
+				JMP CLEARPAGE
+
+SETPAGE2		BIT TXTPAGE2
+
+				; clear screen to #$00				
+CLEARPAGE		JSR CLEARSKY					; 5,422 cycles (or 3,854 if it's unrolled)
+
+
+RESETROW		LDA #$30						; start on row 47
+;				LDX #$0A
+*** modeswitch
+				BIT OPENAPPLE
+				BPL ROW47
+;				LDX #$00
+				LDA #$2F
+ROW47			STA PLOTROW						; 
+ 				STA BASELINE
+;				STX HORIZON
+
+
+				LDA SCREENDATAHI
+				CMP CDEND						; is screendata looking after the end of CANYONDATA?
+				BCC FRAMEDATA						
+				
+RESETDATA		LDA CDHI						; if so, set it back to beginning of terrain data
+				STA SCREENDATAHI
+				LDX #$0
+				STX SCREENDATALO
+
+FRAMEDATA		STA CANYONDATAHI				
+				LDA SCREENDATALO	
+				STA CANYONDATALO
+
+RESETPERSPECTIVE 								; reset perspective processing
+				LDA PDHI						; beginning of "perspective" data
+				STA PERSPECTIVEHI
+				LDA PDLO						;
+				STA PERSPECTIVELO
+
+
+* EACH ROW
+RESETCOLUMN
+
+				LDA #$28
+				STA PLOTCOLUMN					; plotcolumn 40
+
+RESETPROGRESS	LDA #$09						; 8 bits in, decrement each run
+				STA PROGRESS					; zero out ROL count
+
+GETPERSPECTIVE	
+*** mode switch - 00=3D
+;				LDA MODEBYTE
+				BIT OPENAPPLE
+				BPL INCPERSPECTIVE
+
+				LDA PERSPECTIVELO				; have we loaded 40 bytes (1 line)
+				SEC 
+				SBC PDLO
+				CMP #$0F						; 120 bits later...
+				BNE INCPERSPECTIVE
+				
+				LDA PDHI						; beginning of "perspective" data
+				STA PERSPECTIVEHI
+				LDA PDLO						;
+				STA PERSPECTIVELO
+				INC PERSPECTIVELO
+				JMP NEXTPERSPECTIVE
+
+INCPERSPECTIVE	INC PERSPECTIVELO
+				BNE	NEXTPERSPECTIVE
+				INC PERSPECTIVEHI				
+
+NEXTPERSPECTIVE	LDY #$0							
+				LDA (PERSPECTIVELO),Y			; read byte from perspective data
+				BNE NEXTROLBYTE
+
+*** shortcut if zero												
+				CLC
+				LDA CANYONDATALO
+				ADC #$08						; did CANYONDATALO roll over?
+				STA CANYONDATALO
+				BCC JUMPEIGHT
+				INC CANYONDATAHI			
+JUMPEIGHT		JMP GETPERSPECTIVE
+*** shortcut if zero												
+
+
+
+NEXTROLBYTE		STA ROLBYTE						; on 00, skip ahead 8 bytes in terrain
+
+* EACH COLUMN
+
+*** advance to next row when rendering to column #$FF, reset column to $27, decrement row, etc
+
+
+NEXTPIXEL		DEC PROGRESS
+				BEQ RESETPROGRESS				; progress == 00, reload and get new perspective
+
+NEXTTERRAIN		INC CANYONDATALO				; did CANYONDATALO roll over?
+				BNE ROLLY
+				INC CANYONDATAHI				
+				
+ROLLY			CLC
+				ROL ROLBYTE			
+				BCC NEXTPIXEL					; HI bit rolls into CARRY, grab the color byte. 
+
+
+				DEC PLOTCOLUMN					; set up to render on correct column
+				BPL DRAWPIXEL					; if column is still >0, render
+												; column has rolled over to FF. Do next row.
+NEXTROW			
+				DEC PLOTROW						; end of row
+				DEC BASELINE
+
+				LDA PLOTROW						; done with FRAME?
+				CMP HORIZON						; "horizon" at row #$0A (row10)
+				BNE STARTLINE
+
+DONEROWS										; done with all screen rows, move pointer 
+				LDA SCREENDATALO				; SCREENDATA is the starting point of what is displayed
+				CLC								; increment 120 bytes per frame
+				ADC #$78
+				STA SCREENDATALO
+				BCC LOOPTY						; carry set if rolled over
+				INC SCREENDATAHI
+				
+LOOPTY			JMP NEXTFRAME
+
+
+												; moved up a row, shortcut to start next terrain line?
+STARTLINE		LDA #$27
+				STA PLOTCOLUMN					; plotcolumn 39												
+				
+															
+DRAWPIXEL		LDY #$0							
+				LDA (CANYONDATALO),Y			; read in byte at (CANYONDATALO,HI)
+				STA HEIGHTBYTE					; hang onto the height nibble
+				
+				AND #$0F						; strip high nibble - color in low nibble
+				TAX								
+
+*** mode switch - 00=3D mode
+;				LDA MODEBYTE
+				BIT OPENAPPLE
+				BMI TWODMODE
+
+												
+				LSR HEIGHTBYTE					; ROR high nibble down to low
+				LSR HEIGHTBYTE
+				LSR HEIGHTBYTE
+				LSR HEIGHTBYTE					; clears low nibble from HEIGHTBYTE
+				SEC
+				LDA PLOTROW
+				SBC HEIGHTBYTE
+				STA PLOTROW
+				JMP WHICHPAGE
+
+TWODMODE		STA HEIGHTBYTE					; mode=1, height of all columns = 1
+				LDA BASELINE
+				STA PLOTROW
+				
+WHICHPAGE											; loop until height = 0								
+				BIT RDPAGE2
+				BPL DRAWZ2
+
+
+DRAWZ			PLOTQUICK1
+				CONTINUEPLOT					; plot @ baseline - CHAR IN X
+												;  PLOTROW in ACCUMULATOR
+				INC PLOTROW						; inc PLOTROW, going down...
+				LDA PLOTROW
+				CMP BASELINE					; return PLOTROW to baseline
+
+				BCC DRAWZ						; loop and plot next Z
+				JMP NEXTPIXEL
+
+DRAWZ2			PLOTQUICK2
+				CONTINUEPLOT					; plot @ baseline - CHAR IN X
+												;  PLOTROW in ACCUMULATOR
+				INC PLOTROW						; inc PLOTROW, going down...
+				LDA PLOTROW
+				CMP BASELINE					; return PLOTROW to baseline
+
+				BCC DRAWZ2						; loop and plot next Z
+				JMP NEXTPIXEL
+
+SHORTCUTZ		LDA BASELINE					; no more blank pixels below, skip trying to render them				
+				STA PLOTROW
+				JMP NEXTPIXEL
+				
+* EACH COLUMN
+
+
+;	Compare Instruction Results
+;	
+;	Compare Result			N	Z	C
+;	A < Memory				*	0	0
+;	A = Memory				0	1	1
+;	A > Memory				*	0	1
+
+
+
+* EACH ROW
+
+
+
+**************************************************
+*	SUBROUTINES
+
+
+**************************************************
+*	prints one CHAR at PLOTROW,PLOTCOLUMN - clobbers A,X,Y
+*	Used for every pixel. MACRO.
+*	61/67 cycles on a shortcut, 79 to render
+* 	*** now rendering top of column first. ***
+**************************************************
+PLOTQUICK1		MAC	
+												; *** CHAR IN X	
+												; *** PLOTROW in A											
+				LSR								; divide PLOTROW by 2 - odd=CARRY
+				TAY								; get GR row
+												
+				LDA LoLineTableL,Y
+				STA LOBYTE
+				LDA LoLineTableH,Y				; *** for page1
+            	<<<            ; End of Macro
+
+PLOTQUICK2		MAC	
+												; *** CHAR IN X	
+												; *** PLOTROW in A											
+				LSR								; divide PLOTROW by 2 - odd=CARRY
+				TAY								; get GR row
+												
+				LDA LoLineTableL,Y
+				STA LOBYTE
+LDALT			LDA AltLineTableH,Y				; *** for page2
+            	<<<            ; End of Macro
+
+
+
+CONTINUEPLOT	MAC
+STAHIBYTE		STA HIBYTE       		  		; now word/pointer at $0+$1 points to line on TXT page.
+
+				LDY PLOTCOLUMN					; get the current pixel byte
+
+GETSCREENPIXEL	LDA (LOBYTE),Y					; only render if byte is 00 or X0
+
+; row 0 or 1?
+				BCC CHECKEVEN					; carry set = rendering on odd row
+				
+CHECKODD		BNE DONEPLOTQUICK				; only render odd rows on 00		
+				
+RENDERROW1		CLC								; A=0, screen pixel=00, char in X
+				TXA		
+				ROL								; rotate the color nibble left x 4
+				ROL
+				ROL
+				ROL								; color in hi nibble
+				JMP PLOTPIXEL
+
+
+CHECKEVEN		; CARRY CLEAR
+
+				BEQ RENDERBOTH					; shortcut: 00 means rendering onto row 0 (lo nibble)
+; *** WILL DO BOTH ROWS ***
+
+				STA TMP							; store screen pixel	
+												; render on even, only with 00 or X0
+				AND #$0F						; rendering on row 0, clear HI nibble. 
+				BNE SHORTCUTZ					; low nibble nonzero, skip. *** shortcut ***
+
+												
+RENDERROW0		TXA								; Color in X, screen pixel in TMP, lo nibble == 0
+
+				ORA TMP							; combine nibbles into A
+				
+				JMP PLOTPIXEL
+
+
+
+RENDERBOTH		TXA								; *** WILL DO BOTH ROWS ***
+				STX TMP							; A=0, screen pixel = 0, set lo & hi nibbles to color/char (in X)
+				ROL								; TMP has char in lo nibble.
+				ROL								; ROL A into hi nibble.
+				ROL
+				ROL
+				ORA TMP
+				INC PLOTROW						; increment PLOTROW
+												
+PLOTPIXEL		
+				STA (LOBYTE),Y  				; write new pixel to screen
+DONEPLOTQUICK
+            	<<<            ; End of Macro
+
+;/PLOTQUICK			   
+			   
+**************************************************
+*	Load "CANYONDATA" into memory at $3000
+*	Used once
+**************************************************
+
+
+BLOAD   		JSR	OPEN    				;open "CANYONDATA"
+       			JSR READ
+;       			JSR ERROR					
+				JSR CLOSE
+;       			JSR ERROR					
+       			RTS            				;Otherwise done
+				
+OPEN 			JSR	MLI       				;Perform call
+       			DB	OPENCMD    				;CREATE command number
+       			DW	OPENLIST   				;Pointer to parameter list
+;       			JSR	ERROR     				;If error, display it
+       			LDA REFERENCE
+       			STA READLIST+1
+       			STA CLOSELIST+1
+       			RTS				
+
+READ			JSR MLI
+				DB	READCMD
+				DW	READLIST
+				RTS
+
+CLOSE			JSR MLI
+				DB	CLOSECMD
+				DW	CLOSELIST
+				RTS
+				
+ERROR  			JSR	PRBYTE    				;Print error code
+       			JSR	BELL      				;Ring the bell
+       			JSR	CROUT     				;Print a carriage return
+       			RTS				
+
+OPENLIST		DB	$03						; parameter list for OPEN command
+				DW	FILENAME
+				DA	MLI-$400				; buffer snuggled up tight with PRODOS
+REFERENCE		DB	$00						; reference to opened file
+			
+READLIST		DB	$04
+				DB	$00						; REFERENCE written here after OPEN
+				DB	<CANYONDATA,>CANYONDATA	; append to end of program
+				DB	$00,$78					; read to EOF at $7800 (120 * 256)
+TRANSFERRED		DB	$00,$00				
+
+CLOSELIST		DB	$01
+				DB	$00
+				
+FILENAME		DB	ENDNAME-NAME 			;Length of name
+NAME    		ASC	'CANYONDATA' 			;followed by the name
+ENDNAME 		EQU	*
+
+
+
+**************************************************
+* Append one screen from top of terrain to bottom of data for smooth looping
+* Used once
+**************************************************
+
+LOOPTERRAIN		
+
+					LDA	CDLO			; Setup pointers to move memory
+					STA	$3C				; $3C and $3D for source start ($2500)
+					STA	$42				; $42 and $43 for destination ($9d00)
+
+					LDA	CDHI
+					STA	$3D				; grabbing from top of terrain data
+					CLC	
+					ADC	#$11			; screen size = #$11D0 (38 lines x 120 buyes)
+					STA	$3F				; appending to end of terrain data
+					ADC #$67			; 11+66=78
+					STA $43				; destination HI
+					
+					LDA	#$CF			; last byte of extra 11D0 = 11CF
+					STA	$3E				; $3E and $3F for source end
+
+MOVEIMAGE			LDA	#$00			; Clear ACC, X,Y for smooth operation
+					TAX	
+					TAY	
+					JSR	$FE2C    		; F8ROM:MOVE	; Do the memory move
+
+					RTS
+
+**************************************************
+* blanks the screen quickly.
+* Used every frame. Macro?
+* CLOBBERS A,Y 
+**************************************************
+CLEARSKY						
+				LDA #$00
+				LDY #$78
+
+				BIT RDPAGE2				; displaying page 2, clear page 1.
+				BMI FILL1				; and vice versa
+				JMP FILL2
+								
+FILL1			DEY
+				STA $400, Y
+				STA $480, Y
+				STA $500, Y
+				STA $580, Y
+				STA $600, Y
+				STA $680, Y
+				STA $700, Y
+				STA $780, Y
+				BNE FILL1
+				RTS
+
+FILL2			DEY
+				STA $800, Y
+				STA $880, Y
+				STA $900, Y
+				STA $980, Y
+				STA $a00, Y
+				STA $a80, Y
+				STA $b00, Y
+				STA $b80, Y
+				BNE FILL2
+				RTS
+
+**************************************************
+* Data Tables
+*
+**************************************************
+
+
+
+**************************************************
+* Lores/Text lines
+* Thanks to Dagen Brock for this.
+**************************************************
+Lo01                 equ   $400
+Lo02                 equ   $480
+Lo03                 equ   $500
+Lo04                 equ   $580
+Lo05                 equ   $600
+Lo06                 equ   $680
+Lo07                 equ   $700
+Lo08                 equ   $780
+Lo09                 equ   $428
+Lo10                 equ   $4a8
+Lo11                 equ   $528
+Lo12                 equ   $5a8
+Lo13                 equ   $628
+Lo14                 equ   $6a8
+Lo15                 equ   $728
+Lo16                 equ   $7a8
+Lo17                 equ   $450
+Lo18                 equ   $4d0
+Lo19                 equ   $550
+Lo20                 equ   $5d0
+* the "plus four" lines
+Lo21                 equ   $650
+Lo22                 equ   $6d0
+Lo23                 equ   $750
+Lo24                 equ   $7d0
+
+; alt text page lines
+Alt01                 equ   $800
+Alt02                 equ   $880
+Alt03                 equ   $900
+Alt04                 equ   $980
+Alt05                 equ   $A00
+Alt06                 equ   $A80
+Alt07                 equ   $B00
+Alt08                 equ   $B80
+Alt09                 equ   $828
+Alt10                 equ   $8a8
+Alt11                 equ   $928
+Alt12                 equ   $9a8
+Alt13                 equ   $A28
+Alt14                 equ   $Aa8
+Alt15                 equ   $B28
+Alt16                 equ   $Ba8
+Alt17                 equ   $850
+Alt18                 equ   $8d0
+Alt19                 equ   $950
+Alt20                 equ   $9d0
+* the "plus four" lines
+Alt21                 equ   $A50
+Alt22                 equ   $Ad0
+Alt23                 equ   $B50
+Alt24                 equ   $Bd0
+
+
+
+
+LoLineTable          da    	Lo01,Lo02,Lo03,Lo04
+                     da    	Lo05,Lo06,Lo07,Lo08
+                     da		Lo09,Lo10,Lo11,Lo12
+                     da    	Lo13,Lo14,Lo15,Lo16
+                     da		Lo17,Lo18,Lo19,Lo20
+                     da		Lo21,Lo22,Lo23,Lo24
+
+; alt text page
+AltLineTable         da    	Alt01,Alt02,Alt03,Alt04
+                     da    	Alt05,Alt06,Alt07,Alt08
+                     da		Alt09,Alt10,Alt11,Alt12
+                     da    	Alt13,Alt14,Alt15,Alt16
+                     da		Alt17,Alt18,Alt19,Alt20
+                     da		Alt21,Alt22,Alt23,Alt24
+
+
+** Here we split the table for an optimization
+** We can directly get our line numbers now
+** Without using ASL
+LoLineTableH         db    >Lo01,>Lo02,>Lo03
+                     db    >Lo04,>Lo05,>Lo06
+                     db    >Lo07,>Lo08,>Lo09
+                     db    >Lo10,>Lo11,>Lo12
+                     db    >Lo13,>Lo14,>Lo15
+                     db    >Lo16,>Lo17,>Lo18
+                     db    >Lo19,>Lo20,>Lo21
+                     db    >Lo22,>Lo23,>Lo24
+LoLineTableL         db    <Lo01,<Lo02,<Lo03
+                     db    <Lo04,<Lo05,<Lo06
+                     db    <Lo07,<Lo08,<Lo09
+                     db    <Lo10,<Lo11,<Lo12
+                     db    <Lo13,<Lo14,<Lo15
+                     db    <Lo16,<Lo17,<Lo18
+                     db    <Lo19,<Lo20,<Lo21
+                     db    <Lo22,<Lo23,<Lo24
+
+; alt text page
+AltLineTableH        db    >Alt01,>Alt02,>Alt03
+                     db    >Alt04,>Alt05,>Alt06
+                     db    >Alt07,>Alt08,>Alt09
+                     db    >Alt10,>Alt11,>Alt12
+                     db    >Alt13,>Alt14,>Alt15
+                     db    >Alt16,>Alt17,>Alt18
+                     db    >Alt19,>Alt20,>Alt21
+                     db    >Alt22,>Alt23,>Alt24
+AltLineTableL        db    <Alt01,<Alt02,<Alt03
+                     db    <Alt04,<Alt05,<Alt06
+                     db    <Alt07,<Alt08,<Alt09
+                     db    <Alt10,<Alt11,<Alt12
+                     db    <Alt13,<Alt14,<Alt15
+                     db    <Alt16,<Alt17,<Alt18
+                     db    <Alt19,<Alt20,<Alt21
+                     db    <Alt22,<Alt23,<Alt24
+
+
+**************************************************
+* Perspective Table
+*	can I shortcut to next 120px line and cut off trailing 00 bytes?
+**************************************************
+PDLO				db	<PERSPECTIVEDATA
+PDHI				db	>PERSPECTIVEDATA
+PERSPECTIVEDATA		
+ 					HEX	00,00,00,00,00,FF,FF,FF,FF,FF,00,00,00,00,00
+ 					HEX	00,00,00,00,01,7F,FF,F7,FF,FF,80,00,00,00,00
+ 					HEX	00,00,00,00,02,FF,FF,F7,FB,FF,40,00,00,00,00
+ 					HEX	00,00,00,00,05,FF,DF,F7,FD,EF,A0,00,00,00,00
+ 					HEX	00,00,00,00,0B,EF,DF,F7,BD,F7,D0,00,00,00,00
+ 					HEX	00,00,00,00,16,EF,DE,F7,BE,FB,E8,00,00,00,00
+ 					HEX	00,00,00,00,2E,EE,DE,FB,DF,6D,F4,00,00,00,00
+ 					HEX	00,00,00,00,5D,DD,DE,DB,DB,6E,FA,00,00,00,00
+ 					HEX	00,00,00,00,BB,BB,B5,BB,DB,6E,ED,00,00,00,00
+ 					HEX	00,00,00,01,77,57,6D,BB,5B,B7,76,80,00,00,00
+ 					HEX	00,00,00,02,AE,D7,6D,BB,6D,DB,AB,40,00,00,00
+ 					HEX	00,00,00,05,5A,D7,6D,BB,6D,AD,D5,A0,00,00,00
+ 					HEX	00,00,00,0B,5A,D7,6D,B5,B6,D6,AA,D0,00,00,00
+ 					HEX	00,00,00,16,B5,AA,DB,6B,6D,AD,A9,68,00,00,00
+ 					HEX	00,00,00,29,6B,5A,DB,6B,6D,56,D4,B4,00,00,00
+ 					HEX	00,00,00,52,D6,B5,B6,D6,D5,56,95,5A,00,00,00
+ 					HEX	00,00,00,95,56,B5,B6,D6,D5,54,AA,AD,00,00,00
+ 					HEX	00,00,01,4A,AD,6B,6D,56,95,55,55,56,80,00,00
+ 					HEX	00,00,02,AA,AD,6A,6D,55,6A,AA,AA,AA,40,00,00
+ 					HEX	00,00,05,55,52,D4,DA,AA,AA,AA,AA,AA,A0,00,00
+ 					HEX	00,00,0A,AA,AA,AA,AA,AA,AA,AA,AA,AA,90,00,00
+ 					HEX	00,00,14,AA,AA,AA,AA,AA,AA,AA,95,55,28,00,00
+ 					HEX	00,00,29,52,AA,A5,55,55,55,55,55,4A,94,00,00
+ 					HEX	00,00,52,A5,55,2A,AA,A9,55,54,AA,A5,4A,00,00
+ 					HEX	00,00,A5,4A,AA,55,54,A5,4A,AA,55,52,A5,00,00
+ 					HEX	00,01,4A,95,52,A9,54,A5,2A,55,4A,A9,52,80,00
+ 					HEX	00,02,95,29,52,A9,54,A5,2A,55,4A,54,A9,40,00
+ 					HEX	00,05,2A,52,A5,52,A9,4A,4A,52,A5,2A,54,A0,00
+ 					HEX	00,0A,54,A5,4A,A5,52,94,94,A5,4A,4A,4A,50,00
+ 					HEX	00,14,A5,52,4A,52,94,A5,24,A5,2A,94,A5,28,00
+ 					HEX	00,29,25,29,4A,52,94,A5,29,4A,52,94,92,94,00
+ 					HEX	00,52,49,4A,52,95,49,52,4A,4A,94,A4,92,4A,00
+ 					HEX	00,A4,AA,92,52,92,49,29,24,94,94,A4,92,95,00
+ 					HEX	01,4A,A5,24,A4,92,49,24,92,49,25,29,54,92,80
+ 					HEX	02,92,55,24,A4,92,49,24,92,49,25,25,25,49,40
+ 					HEX	05,24,92,49,49,24,92,52,49,24,94,92,4A,A5,20
+ 					HEX	0A,49,24,92,49,24,92,52,49,24,92,4A,92,49,50
+ 					HEX	12,49,24,92,49,24,95,49,24,92,49,24,92,49,48
+ 					HEX	24,92,49,24,92,49,24,92,49,24,92,49,24,92,A4
+ 					HEX	49,24,92,49,24,92,49,24,92,49,24,92,49,24,92
+					
+CDLO				db	<CANYONDATA
+CDHI				db	>CANYONDATA
+
+					DS \
+
+CANYONDATA			EQU *
+										
+					
